@@ -1,4 +1,3 @@
-cat > README.md <<'EOF'
 # MusicDB Failover Test
 
 Theme: **Testing DB node failure in a music streaming DBMS**
