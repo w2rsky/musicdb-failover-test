@@ -1712,6 +1712,661 @@ docker compose logs --tail=100
 Проект показывает, что standby-узел PostgreSQL может стать новым master-узлом для записи после отказа основного узла, если arbiter подтверждает безопасность повышения.
 
 ---
+---
+
+# Part 2 — Automated Failover Verification
+
+## English Version
+
+## 1. Purpose of Part 2
+
+Part 2 extends the project from a manual PostgreSQL failover demonstration into an **automated verification system**.
+
+The main verified property is:
+
+> If an insert request received successful transaction commit confirmation, that inserted row must not be lost after database failure and recovery.
+
+The verifier performs stress testing against the PostgreSQL cluster from Part 1. It sends many asynchronous insert requests, injects a failure in the middle of the test, waits for failover or recovery, and then compares:
+
+| Source               | Meaning                                                     |
+| -------------------- | ----------------------------------------------------------- |
+| Client memory        | Numbers that were confirmed as successfully inserted        |
+| Final database state | Numbers actually found in PostgreSQL after failure recovery |
+
+Extra rows in the database are acceptable.
+
+Missing rows that were already acknowledged as successful are **not acceptable**.
+
+---
+
+## 2. Part 2 Architecture
+
+```mermaid
+flowchart LR
+    Tester[Part 2 Verifier<br/>Async Python Client] --> Master[(PostgreSQL Master)]
+    Master -- WAL Streaming Replication --> Standby[(PostgreSQL Standby)]
+    Standby --> Arbiter[Arbiter / Witness]
+
+    Tester -- Inserts unique numbers --> Master
+    Tester -- Injects failure --> Failure[Failure Scenario]
+    Failure --> Master
+
+    Arbiter -- Confirms master failure --> Standby
+    Standby -- pg_ctl promote --> NewMaster[(Promoted Standby)]
+
+    Tester -- Reads final rows --> NewMaster
+    Tester -- Compares acknowledged rows<br/>with actual DB rows --> Result{Verification Result}
+
+    Result -- Missing acknowledged rows --> Failed[FAILED]
+    Result -- No missing acknowledged rows --> Passed[PASSED]
+
+    classDef client fill:#334155,color:#ffffff,stroke:#94a3b8,stroke-width:2px;
+    classDef master fill:#0369a1,color:#ffffff,stroke:#38bdf8,stroke-width:2px;
+    classDef standby fill:#4c1d95,color:#ffffff,stroke:#a78bfa,stroke-width:2px;
+    classDef arbiter fill:#065f46,color:#ffffff,stroke:#34d399,stroke-width:2px;
+    classDef result fill:#78350f,color:#ffffff,stroke:#fbbf24,stroke-width:2px;
+    classDef bad fill:#7f1d1d,color:#ffffff,stroke:#f87171,stroke-width:2px;
+    classDef good fill:#064e3b,color:#ffffff,stroke:#34d399,stroke-width:2px;
+
+    class Tester client;
+    class Master,NewMaster master;
+    class Standby standby;
+    class Arbiter arbiter;
+    class Result result;
+    class Failed bad;
+    class Passed good;
+```
+
+---
+
+## 3. Verification Algorithm
+
+```mermaid
+flowchart TD
+    A[Deploy empty PostgreSQL cluster] --> B[Create table part2_numbers]
+    B --> C[Start asynchronous insert workload]
+    C --> D[Each request inserts one unique number]
+    D --> E{Insert finished without error?}
+
+    E -- Yes --> F[Remember number in client memory]
+    E -- No --> G[Count request as failed]
+
+    F --> H[Continue workload]
+    G --> H
+
+    H --> I{Middle of workload reached?}
+    I -- No --> C
+    I -- Yes --> J[Inject selected failure]
+
+    J --> K{Did master fail?}
+    K -- Yes --> L[Run failover agent]
+    L --> M[Promote standby]
+    K -- No --> N[Continue with available node]
+
+    M --> O[Read all rows from final database]
+    N --> O
+
+    O --> P[Compare acknowledged rows with actual rows]
+    P --> Q{Any acknowledged row missing?}
+
+    Q -- Yes --> R[FAILED: data loss detected]
+    Q -- No --> S[PASSED: no acknowledged data loss]
+
+    classDef good fill:#065f46,color:#ffffff,stroke:#34d399,stroke-width:2px;
+    classDef bad fill:#7f1d1d,color:#ffffff,stroke:#f87171,stroke-width:2px;
+    classDef process fill:#1e3a8a,color:#ffffff,stroke:#60a5fa,stroke-width:2px;
+    classDef decision fill:#78350f,color:#ffffff,stroke:#fbbf24,stroke-width:2px;
+
+    class A,B,C,D,F,G,H,J,L,M,N,O,P process;
+    class E,I,K,Q decision;
+    class R bad;
+    class S good;
+```
+
+---
+
+## 4. Test Table
+
+Part 2 uses a minimal table with one primary-key column:
+
+```sql
+CREATE TABLE part2_numbers (
+    id BIGINT PRIMARY KEY
+);
+```
+
+Each asynchronous request inserts exactly one unique number:
+
+```sql
+INSERT INTO part2_numbers(id) VALUES ($1);
+```
+
+| Element          | Purpose                               |
+| ---------------- | ------------------------------------- |
+| `id`             | Unique number inserted by one request |
+| `PRIMARY KEY`    | Prevents duplicate accepted rows      |
+| One-column table | Makes verification simple and strict  |
+
+---
+
+## 5. Failure Scenarios
+
+The verifier can inject several failure scenarios.
+
+| Failure Scenario            | Description                                           |
+| --------------------------- | ----------------------------------------------------- |
+| `master_crash`              | Kills the master PostgreSQL container using `SIGKILL` |
+| `master_network_partition`  | Disconnects master from the Docker network            |
+| `standby_network_partition` | Disconnects standby from the Docker network           |
+| `arbiter_network_partition` | Disconnects arbiter from the Docker network           |
+
+The main scenario for data-safety verification is:
+
+```text
+master_crash
+```
+
+This scenario checks whether acknowledged writes survive after the standby node is promoted.
+
+---
+
+## 6. synchronous_commit Verification Matrix
+
+Part 2 verifies different PostgreSQL `synchronous_commit` modes.
+
+| synchronous_commit | Expected Behavior                  |
+| ------------------ | ---------------------------------- |
+| `off`              | Data loss may be detected          |
+| `local`            | Data loss may be detected          |
+| `remote_write`     | No acknowledged data loss expected |
+| `on`               | No acknowledged data loss expected |
+| `remote_apply`     | No acknowledged data loss expected |
+
+Unsafe modes are useful because the verifier should be able to expose possible data loss.
+
+Safe modes are expected to pass when synchronous replication is configured correctly.
+
+---
+
+## 7. Part 2 Files
+
+| File                      | Purpose                                                   |
+| ------------------------- | --------------------------------------------------------- |
+| `scripts/part2_verify.py` | Runs one automated verification test                      |
+| `scripts/part2_matrix.sh` | Runs verification for multiple `synchronous_commit` modes |
+| `docs/PART2.md`           | Detailed Part 2 documentation                             |
+| `requirements.txt`        | Python dependencies                                       |
+| `reports/`                | Stores matrix test logs                                   |
+
+---
+
+## 8. Python Virtual Environment
+
+Part 2 uses `asyncpg`, so the project should be run inside a Python virtual environment.
+
+Create and activate the virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The `.venv/` directory must not be committed to GitHub.
+
+It should be listed in `.gitignore`:
+
+```text
+.venv/
+```
+
+---
+
+## 9. Run a Small Debug Test
+
+Before running the full test, run a smaller verification:
+
+```bash
+source .venv/bin/activate
+
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 1000 \
+  --concurrency 50 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+Expected successful output:
+
+```text
+missing_acknowledged_rows=0
+PASSED: no acknowledged committed rows were lost.
+```
+
+---
+
+## 10. Run a Larger Local Test
+
+```bash
+source .venv/bin/activate
+
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 10000 \
+  --concurrency 100 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+---
+
+## 11. Run the Required 1 Million Request Test
+
+```bash
+source .venv/bin/activate
+
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 1000000 \
+  --concurrency 200 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+Expected safe result:
+
+```text
+missing_acknowledged_rows=0
+PASSED: no acknowledged committed rows were lost.
+```
+
+---
+
+## 12. Run the synchronous_commit Matrix
+
+Small matrix test:
+
+```bash
+source .venv/bin/activate
+REQUESTS=10000 ./scripts/part2_matrix.sh
+```
+
+Full matrix test:
+
+```bash
+source .venv/bin/activate
+REQUESTS=1000000 ./scripts/part2_matrix.sh
+```
+
+The matrix checks these modes:
+
+```text
+off
+local
+remote_write
+on
+remote_apply
+```
+
+Logs are saved in:
+
+```text
+reports/
+```
+
+Example report files:
+
+```text
+reports/part2_off_master_crash.log
+reports/part2_local_master_crash.log
+reports/part2_remote_write_master_crash.log
+reports/part2_on_master_crash.log
+reports/part2_remote_apply_master_crash.log
+```
+
+---
+
+## 13. Result Interpretation
+
+| Result                          | Meaning                                                             |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `PASSED`                        | No acknowledged committed rows were lost                            |
+| `FAILED`                        | At least one acknowledged row is missing from the final database    |
+| `extra_rows_allowed > 0`        | Acceptable; DB contains rows that client did not mark as successful |
+| `missing_acknowledged_rows > 0` | Not acceptable; confirmed data was lost                             |
+
+The main correctness condition is:
+
+```text
+missing_acknowledged_rows = 0
+```
+
+---
+
+## 14. Example Successful Output
+
+```text
+=== Verification result ===
+acknowledged_successes=9872
+actual_rows=9872
+failed_requests=128
+duplicate_requests=0
+extra_rows_allowed=0
+missing_acknowledged_rows=0
+PASSED: no acknowledged committed rows were lost.
+```
+
+---
+
+## 15. Example Failed Output
+
+```text
+=== Verification result ===
+acknowledged_successes=9840
+actual_rows=9827
+failed_requests=160
+duplicate_requests=0
+extra_rows_allowed=0
+missing_acknowledged_rows=13
+FAILED: acknowledged rows were lost.
+```
+
+This type of failure may happen with unsafe settings such as:
+
+```text
+synchronous_commit=off
+synchronous_commit=local
+```
+
+---
+
+## 16. Troubleshooting
+
+### Test hangs after master crash
+
+Reset the cluster:
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+Then rerun a smaller test:
+
+```bash
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 1000 \
+  --concurrency 50 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+### Python package installation fails on Debian
+
+Use the virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Do not use:
+
+```bash
+python3 -m pip install --user -r requirements.txt
+```
+
+### Docker permission denied
+
+Fix Docker group access:
+
+```bash
+sudo usermod -aG docker $USER
+newgrp docker
+docker ps
+```
+
+### Containers are missing
+
+Start the cluster:
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+---
+
+# Часть 2 — Автоматическая верификация отказоустойчивости
+
+## 1. Назначение части 2
+
+Часть 2 расширяет проект: теперь это не только демонстрация failover, но и **автоматическая система проверки отказоустойчивости**.
+
+Проверяется главное утверждение:
+
+> Если запрос получил подтверждение успешной фиксации транзакции, то соответствующая строка не должна быть потеряна после отказа и восстановления системы.
+
+Система тестирования выполняет асинхронные вставки, запоминает успешно подтверждённые номера, затем вызывает отказ и проверяет итоговое состояние базы данных.
+
+| Источник данных      | Значение                                                 |
+| -------------------- | -------------------------------------------------------- |
+| Память клиента       | Номера, которые были успешно вставлены по мнению клиента |
+| Итоговая база данных | Номера, реально найденные в PostgreSQL после отказа      |
+
+Дополнительные строки в базе допустимы.
+
+Потеря подтверждённых строк недопустима.
+
+---
+
+## 2. Алгоритм проверки
+
+```mermaid
+flowchart TD
+    A[Развернуть пустой кластер] --> B[Создать таблицу part2_numbers]
+    B --> C[Запустить асинхронную нагрузку]
+    C --> D[Каждый запрос вставляет один уникальный номер]
+    D --> E{Запрос завершился без ошибки?}
+
+    E -- Да --> F[Запомнить номер в памяти клиента]
+    E -- Нет --> G[Считать запрос ошибочным]
+
+    F --> H[Продолжить нагрузку]
+    G --> H
+
+    H --> I{Достигнута середина теста?}
+    I -- Нет --> C
+    I -- Да --> J[Сымитировать отказ]
+
+    J --> K{Отказал master?}
+    K -- Да --> L[Запустить failover-agent]
+    L --> M[Повысить standby]
+    K -- Нет --> N[Продолжить работу]
+
+    M --> O[Прочитать строки из итоговой БД]
+    N --> O
+
+    O --> P[Сравнить подтверждённые строки с фактическими]
+    P --> Q{Есть потерянные подтверждённые строки?}
+
+    Q -- Да --> R[FAILED: обнаружена потеря данных]
+    Q -- Нет --> S[PASSED: потери подтверждённых данных нет]
+
+    classDef good fill:#065f46,color:#ffffff,stroke:#34d399,stroke-width:2px;
+    classDef bad fill:#7f1d1d,color:#ffffff,stroke:#f87171,stroke-width:2px;
+    classDef process fill:#1e3a8a,color:#ffffff,stroke:#60a5fa,stroke-width:2px;
+    classDef decision fill:#78350f,color:#ffffff,stroke:#fbbf24,stroke-width:2px;
+
+    class A,B,C,D,F,G,H,J,L,M,N,O,P process;
+    class E,I,K,Q decision;
+    class R bad;
+    class S good;
+```
+
+---
+
+## 3. Таблица для проверки
+
+В части 2 используется простая таблица:
+
+```sql
+CREATE TABLE part2_numbers (
+    id BIGINT PRIMARY KEY
+);
+```
+
+Каждый запрос выполняет одну вставку:
+
+```sql
+INSERT INTO part2_numbers(id) VALUES ($1);
+```
+
+| Элемент       | Назначение                  |
+| ------------- | --------------------------- |
+| `id`          | Уникальный номер запроса    |
+| `PRIMARY KEY` | Защита от дублей            |
+| Одна колонка  | Простая проверка результата |
+
+---
+
+## 4. Сценарии отказов
+
+| Сценарий                    | Описание                                    |
+| --------------------------- | ------------------------------------------- |
+| `master_crash`              | Принудительное завершение контейнера master |
+| `master_network_partition`  | Отключение master от Docker-сети            |
+| `standby_network_partition` | Отключение standby от Docker-сети           |
+| `arbiter_network_partition` | Отключение arbiter от Docker-сети           |
+
+Основной сценарий:
+
+```text
+master_crash
+```
+
+Он проверяет, сохраняются ли подтверждённые записи после повышения standby.
+
+---
+
+## 5. Проверка synchronous_commit
+
+| synchronous_commit | Ожидаемое поведение                         |
+| ------------------ | ------------------------------------------- |
+| `off`              | Возможна потеря данных                      |
+| `local`            | Возможна потеря данных                      |
+| `remote_write`     | Потери подтверждённых данных быть не должно |
+| `on`               | Потери подтверждённых данных быть не должно |
+| `remote_apply`     | Потери подтверждённых данных быть не должно |
+
+Небезопасные режимы нужны, чтобы система тестирования могла обнаружить возможную потерю данных.
+
+Безопасные режимы должны проходить проверку при корректной синхронной репликации.
+
+---
+
+## 6. Файлы части 2
+
+| Файл                      | Назначение                                            |
+| ------------------------- | ----------------------------------------------------- |
+| `scripts/part2_verify.py` | Один автоматический тест верификации                  |
+| `scripts/part2_matrix.sh` | Запуск тестов для разных режимов `synchronous_commit` |
+| `docs/PART2.md`           | Подробная документация части 2                        |
+| `requirements.txt`        | Python-зависимости                                    |
+| `reports/`                | Логи тестов                                           |
+
+---
+
+## 7. Запуск теста
+
+Активировать виртуальное окружение:
+
+```bash
+source .venv/bin/activate
+```
+
+Запустить небольшой тест:
+
+```bash
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 1000 \
+  --concurrency 50 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+Запустить тест на 1 миллион запросов:
+
+```bash
+python scripts/part2_verify.py \
+  --reset-cluster \
+  --requests 1000000 \
+  --concurrency 200 \
+  --synchronous-commit on \
+  --fault master_crash
+```
+
+---
+
+## 8. Запуск матрицы тестов
+
+```bash
+source .venv/bin/activate
+REQUESTS=1000000 ./scripts/part2_matrix.sh
+```
+
+Матрица проверяет режимы:
+
+```text
+off
+local
+remote_write
+on
+remote_apply
+```
+
+---
+
+## 9. Ожидаемый результат
+
+Успешный результат:
+
+```text
+missing_acknowledged_rows=0
+PASSED: no acknowledged committed rows were lost.
+```
+
+Неуспешный результат:
+
+```text
+missing_acknowledged_rows > 0
+FAILED: acknowledged rows were lost.
+```
+
+Главное условие корректности:
+
+```text
+Все строки, подтверждённые клиенту как успешно вставленные, должны существовать в итоговой базе данных.
+```
+
+---
+
+## 10. Итог части 2
+
+Часть 2 показывает не только сам механизм failover, но и проверяет корректность обработки отказа.
+
+Проект подтверждает, что при безопасных настройках PostgreSQL и синхронной репликации standby-узел может быть повышен до нового master без потери подтверждённых транзакций.
+
 
 ## License / Лицензия
 
