@@ -58,12 +58,12 @@ class ArbiterHandler(BaseHTTPRequestHandler):
 
 def run_arbiter(args):
     server = HTTPServer((args.bind, args.port), ArbiterHandler)
-    print(f"Arbiter listening on {args.bind}:{args.port}")
+    print(f"Arbiter listening on {args.bind}:{args.port}", flush=True)
     server.serve_forever()
 
 
 def run_command(command, check=True):
-    print("+ " + " ".join(command))
+    print("+ " + " ".join(command), flush=True)
     return subprocess.run(
         command,
         text=True,
@@ -93,7 +93,7 @@ def standby_is_in_recovery(container: str) -> bool:
     )
 
     if result.returncode != 0:
-        print(result.stderr.strip())
+        print(result.stderr.strip(), flush=True)
         return False
 
     return result.stdout.strip().lower() == "t"
@@ -101,7 +101,7 @@ def standby_is_in_recovery(container: str) -> bool:
 
 def promote_standby(container: str):
     if not standby_is_in_recovery(container):
-        print("Standby is already promoted or not available.")
+        print("Standby is already promoted or not available.", flush=True)
         return
 
     result = run_command(
@@ -119,13 +119,14 @@ def promote_standby(container: str):
         check=False,
     )
 
-    print(result.stdout.strip())
+    if result.stdout.strip():
+        print(result.stdout.strip(), flush=True)
 
     if result.returncode != 0:
-        print(result.stderr.strip())
+        print(result.stderr.strip(), flush=True)
         sys.exit(result.returncode)
 
-    print("Standby promotion command executed.")
+    print("Standby promotion command executed.", flush=True)
 
 
 def ask_arbiter(arbiter_url: str, master_host: str, master_port: int) -> bool:
@@ -139,10 +140,10 @@ def ask_arbiter(arbiter_url: str, master_host: str, master_port: int) -> bool:
 
 
 def run_standby_agent(args):
-    print("Standby failover agent started.")
-    print(f"Local master check: {args.master_host}:{args.master_port}")
-    print(f"Arbiter URL: {args.arbiter_url}")
-    print(f"Standby container: {args.standby_container}")
+    print("Standby failover agent started.", flush=True)
+    print(f"Local master check: {args.master_host}:{args.master_port}", flush=True)
+    print(f"Arbiter URL: {args.arbiter_url}", flush=True)
+    print(f"Standby container: {args.standby_container}", flush=True)
 
     while True:
         master_seen_by_standby = tcp_reachable(
@@ -152,9 +153,9 @@ def run_standby_agent(args):
         )
 
         if master_seen_by_standby:
-            print("Master is reachable from standby agent. No failover.")
+            print("Master is reachable from standby agent. No failover.", flush=True)
         else:
-            print("Master is NOT reachable from standby agent. Asking arbiter...")
+            print("Master is NOT reachable from standby agent. Asking arbiter...", flush=True)
 
             try:
                 master_seen_by_arbiter = ask_arbiter(
@@ -163,15 +164,15 @@ def run_standby_agent(args):
                     args.master_port,
                 )
             except Exception as exc:
-                print(f"Arbiter unavailable or error: {exc}")
-                print("No promotion. This prevents split-brain.")
+                print(f"Arbiter unavailable or error: {exc}", flush=True)
+                print("No promotion. This prevents split-brain.", flush=True)
                 master_seen_by_arbiter = True
 
             if not master_seen_by_arbiter:
-                print("Arbiter also cannot reach master. Promotion is safe.")
+                print("Arbiter also cannot reach master. Promotion is safe.", flush=True)
                 promote_standby(args.standby_container)
             else:
-                print("Arbiter can still reach master. No promotion.")
+                print("Arbiter can still reach master. No promotion.", flush=True)
 
         if args.once:
             break
