@@ -8,6 +8,7 @@ max_wal_senders = 10
 max_replication_slots = 10
 hot_standby = on
 synchronous_commit = on
+synchronous_standby_names = 'pg_standby'
 PGCONF
 
 cat >> "$PGDATA/pg_hba.conf" <<'PGHBA'

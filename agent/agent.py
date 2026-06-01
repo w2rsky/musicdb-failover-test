@@ -162,7 +162,7 @@ def run_standby_agent(args):
                     args.arbiter_url,
                     args.arbiter_master_host,
                     args.master_port,
-                )
+              )
             except Exception as exc:
                 print(f"Arbiter unavailable or error: {exc}", flush=True)
                 print("No promotion. This prevents split-brain.", flush=True)
