@@ -1,0 +1,74 @@
+services:
+  postgres-master:
+    image: postgres:16
+    container_name: pg_master
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: musicdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - master_data:/var/lib/postgresql/data
+      - ./docker/master/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d musicdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - musicnet
+
+  postgres-standby:
+    image: postgres:16
+    container_name: pg_standby
+    restart: unless-stopped
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: musicdb
+      PRIMARY_HOST: postgres-master
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: repl_user
+      REPLICATION_PASSWORD: repl_password
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    volumes:
+      - standby_data:/var/lib/postgresql/data
+      - ./docker/standby/standby-entrypoint.sh:/standby-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/standby-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d musicdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - musicnet
+
+  arbiter:
+    image: python:3.12-slim
+    container_name: pg_arbiter
+    restart: unless-stopped
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    volumes:
+      - ./agent:/app:ro
+    command: ["python", "/app/agent.py", "arbiter", "--bind", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    networks:
+      - musicnet
+
+volumes:
+  master_data:
+  standby_data:
+
+networks:
+  musicnet:
+    driver: bridge
